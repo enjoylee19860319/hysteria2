@@ -2,7 +2,7 @@
 # ==============================================================================
 # Hysteria2 极简依赖安装脚本 (phy2.sh)
 # 适配系统: Linux (Debian / Ubuntu / CentOS / Rocky / AlmaLinux / Fedora / Alpine / Arch 等)
-# 设计原则: 零破坏性系统环境、最小必要依赖、确保 hysteria2.py 运行无虞
+# 设计原则: 零破坏性系统环境、最小必要依赖、磁盘空间占用统计
 # ==============================================================================
 
 set -euo pipefail
@@ -131,8 +131,6 @@ install_dependencies() {
                 py3-requests
             ;;
     esac
-
-    log_succ "基础依赖安装完毕！"
 }
 
 # 4. 验证 Python 与核心模块
@@ -146,16 +144,40 @@ verify_environment() {
     fi
 }
 
+# 5. 获取根分区已用磁盘空间 (KB)
+get_disk_used_kb() {
+    df -Pk / | awk 'NR==2 {print $3}'
+}
+
 main() {
     check_root
     detect_os
+
+    local disk_before
+    disk_before=$(get_disk_used_kb)
+
     install_dependencies
     verify_environment
-    echo -e "\n${GREEN}====================================================${PLAIN}"
-    echo -e "${GREEN}  Hysteria2 依赖环境初始化完成！${PLAIN}"
-    echo -e "  接下来您可以直接运行:"
-    echo -e "  ${YELLOW}python3 hysteria2.py${PLAIN}"
-    echo -e "${GREEN}====================================================${PLAIN}\n"
+
+    local disk_after
+    disk_after=$(get_disk_used_kb)
+
+    local disk_diff=$(( disk_after - disk_before ))
+    if (( disk_diff > 0 )); then
+        local disk_usage
+        disk_usage=$(awk -v k="$disk_diff" 'BEGIN {
+            if (k >= 1048576) {
+                printf "%.2f GB", k/1048576
+            } else if (k >= 1024) {
+                printf "%.2f MB", k/1024
+            } else {
+                printf "%d KB", k
+            }
+        }')
+        log_succ "依赖安装完成！本次更新共占用磁盘空间: ${disk_usage}"
+    else
+        log_succ "依赖安装完成！所有组件已就绪，未产生新增磁盘占用。"
+    fi
 }
 
 main "$@"
