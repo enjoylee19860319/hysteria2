@@ -1,5 +1,6 @@
 # hysteria2  一键安装脚本
 import glob
+import hashlib
 import ipaddress
 import os
 import re
@@ -105,7 +106,6 @@ def hysteria2_uninstall():   #卸载hysteria2
                 "/etc/systemd/system/hysteria-iptables.service",
                 "/etc/hy2config/iptables-rules.v4",
                 "/etc/hy2config/iptables-rules.v6",
-                "/etc/ssl/private/",
                 "/etc/hy2config",
                 "/usr/local/bin/hy2"
             ]
@@ -415,6 +415,7 @@ iptables -t nat -D PREROUTING -i {interface_name} -p udp --dport {first_port}:{l
                 hy2_domain = ""
                 domain_name = ""
                 insecure = ""
+                certificate_pin_sha256 = ""
 
                 while True:
                     print("1. 自动申请域名证书\n2. 使用自签证书(不需要域名)\n3. 手动选择证书路径")
@@ -533,103 +534,104 @@ iptables -t nat -D PREROUTING -i {interface_name} -p udp --dport {first_port}:{l
                                     # 如果备用方法也失败，让用户手动输入
                                     return validate_and_get_ipv4()
 
-                        def get_ipv6_info():    #获取ipv6地址
-                            """获取IPv6地址，返回带方括号的地址字符串"""
-                            headers = {
-                                'User-Agent': 'Mozilla'
-                            }
-                            try:
-                                response = requests.get('https://api.ip.sb/geoip', headers=headers, timeout=3)
-                                response.raise_for_status()
-                                ip_data = response.json()
-                                isp = ip_data.get('isp', '')
-
-                                if 'cloudflare' in isp.lower():
-                                    print("检测到Warp，请输入正确的服务器 IPv6 地址")
-                                    ipv6_input = validate_and_get_ipv6()
-                                    ip = f"[{ipv6_input}]"
-                                else:
-                                    ip = f"[{ip_data.get('ip', '')}]"
-
-                                print(f"IPV6 WAN IP: {ip}")
-                                return ip
-
-                            except requests.RequestException as e:
-                                print(f"请求失败: {e}")
-                                print("尝试使用备用方法获取IP地址...")
-                                # 使用备用方法获取IPv6地址
+                        def get_ipv6_info():    # 获取ipv6地址
+                            """获取IPv6地址，强制使用 curl -6 走 IPv6 协议栈并返回带方括号的地址字符串"""
+                            print("正在通过 curl -6 获取服务器 IPv6 地址...")
+                            ipv6_endpoints = [
+                                "https://ifconfig.me",
+                                "https://api64.ipify.org",
+                                "https://icanhazip.com",
+                                "https://api.ip.sb/ip"
+                            ]
+                            for endpoint in ipv6_endpoints:
                                 try:
-                                    result = subprocess.run(['curl', '-6', '-s', 'ifconfig.me'], capture_output=True, text=True, timeout=5)
+                                    result = subprocess.run(
+                                        ["curl", "-6", "-s", "--max-time", "5", endpoint],
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=6
+                                    )
                                     if result.returncode == 0 and result.stdout.strip():
                                         ip = result.stdout.strip()
-                                        # 验证IPv6格式
-                                        try:
-                                            ipaddress.IPv6Address(ip)
-                                            formatted = f"[{ip}]"
-                                            print(f"IPV6 WAN IP: {formatted}")
-                                            return formatted
-                                        except ipaddress.AddressValueError:
-                                            # 格式无效，让用户手动输入
-                                            ipv6_input = validate_and_get_ipv6()
-                                            return f"[{ipv6_input}]"
-                                    else:
-                                        # 如果还是失败，让用户手动输入
-                                        ipv6_input = validate_and_get_ipv6()
-                                        return f"[{ipv6_input}]"
-                                except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, FileNotFoundError):
-                                    # 如果备用方法也失败，让用户手动输入
-                                    ipv6_input = validate_and_get_ipv6()
-                                    return f"[{ipv6_input}]"
+                                        # 严格校验是否为有效 IPv6 地址
+                                        ipaddress.IPv6Address(ip)
+                                        formatted = f"[{ip}]"
+                                        print(f"IPV6 WAN IP: {formatted}")
+                                        return formatted
+                                except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, ipaddress.AddressValueError):
+                                    continue
+
+                            print("\033[91m自动获取 IPv6 地址失败，请手动输入...\033[m")
+                            ipv6_input = validate_and_get_ipv6()
+                            return f"[{ipv6_input}]"
 
                         def generate_certificate():      #生成自签证书
-                            """生成自签证书，返回使用的域名"""
-                            # 使用循环代替递归，避免栈溢出
+                            """生成合规的 EC 自签证书（含 SAN 扩展与安全权限控制）"""
                             while True:
-                                # 提示用户输入域名
                                 user_domain = input("请输入要用于自签名证书的域名（默认为 bing.com）: ")
                                 cert_domain = user_domain.strip() if user_domain else "bing.com"
 
-                                # 验证域名格式
                                 if not re.match(r'^[a-zA-Z0-9.-]+$', cert_domain):
-                                    print("无效的域名格式，请输入有效的域名！")
-                                    continue  # 修复：循环重试而非递归
+                                    print("\033[91m无效的域名格式，请输入有效的域名！\033[m")
+                                    continue
 
-                                # 定义目标目录
-                                target_dir = "/etc/ssl/private"
+                                # 智能判断 SAN 扩展类型（IP 或 DNS）
+                                try:
+                                    ipaddress.ip_address(cert_domain)
+                                    san_type = "IP"
+                                except ValueError:
+                                    san_type = "DNS"
 
-                                # 检查并创建目标目录
-                                os.makedirs(target_dir, mode=0o755, exist_ok=True)
+                                target_dir = Path("/etc/hy2config/ssl")
+                                target_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+                                target_dir.chmod(0o755)
 
-                                # 生成 EC 参数文件
-                                ec_param_file = f"{target_dir}/ec_param.pem"
-                                subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-out", ec_param_file],
-                                               check=True)
+                                key_file = target_dir / f"{cert_domain}.key"
+                                crt_file = target_dir / f"{cert_domain}.crt"
 
-                                # 生成证书和私钥
+                                # 单命令生成 ECC prime256v1 证书与私钥，并注入 SAN 扩展
                                 cmd = [
-                                    "openssl", "req", "-x509", "-nodes", "-newkey", f"ec:{ec_param_file}",
-                                    "-keyout", f"{target_dir}/{cert_domain}.key",
-                                    "-out", f"{target_dir}/{cert_domain}.crt",
-                                    "-subj", f"/CN={cert_domain}", "-days", "36500"
+                                    "openssl", "req", "-x509", "-nodes",
+                                    "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                                    "-keyout", str(key_file),
+                                    "-out", str(crt_file),
+                                    "-subj", f"/CN={cert_domain}",
+                                    "-addext", f"subjectAltName={san_type}:{cert_domain}",
+                                    "-days", "3650"
                                 ]
-                                subprocess.run(cmd, check=True)
+                                try:
+                                    subprocess.run(cmd, check=True)
+                                    certificate_der = subprocess.run(
+                                        ["openssl", "x509", "-in", str(crt_file), "-outform", "DER"],
+                                        check=True,
+                                        capture_output=True
+                                    ).stdout
+                                except subprocess.CalledProcessError as e:
+                                    print(f"\033[91mOpenSSL 证书生成或指纹计算失败: {e}\033[m")
+                                    continue
 
-                                # 设置文件权限，确保 hysteria 服务用户可读取
-                                os.chmod(f"{target_dir}/{cert_domain}.key", 0o644)   # 私钥需要 hysteria 用户可读
-                                os.chmod(f"{target_dir}/{cert_domain}.crt", 0o644)   # 证书所有人可读
-                                os.chmod(target_dir, 0o755)                          # 目录权限
-                                # 尝试将证书文件所有权交给 hysteria 用户（如果该用户存在）
-                                subprocess.run(["chown", "root:hysteria",
-                                               f"{target_dir}/{cert_domain}.key",
-                                               f"{target_dir}/{cert_domain}.crt"],
-                                              stderr=subprocess.DEVNULL)
+                                if not certificate_der:
+                                    print("\033[91m证书指纹计算失败：未读取到 DER 证书内容\033[m")
+                                    continue
 
-                                print("自签名证书和私钥已生成！")
-                                print(f"证书文件已保存到 {target_dir}/{cert_domain}.crt")
-                                print(f"私钥文件已保存到 {target_dir}/{cert_domain}.key")
-                                return cert_domain
+                                certificate_sha256 = hashlib.sha256(certificate_der).hexdigest()
 
-                        domain_name = generate_certificate()
+                                # 安全权限控制：私钥仅 root 与 hysteria 组可读 (0640)，证书全局可读 (0644)
+                                try:
+                                    key_file.chmod(0o640)
+                                    crt_file.chmod(0o644)
+                                    subprocess.run(["chown", "root:hysteria", str(key_file), str(crt_file)],
+                                                   stderr=subprocess.DEVNULL)
+                                except OSError:
+                                    pass
+
+                                print("\033[92m自签名 ECC 证书和私钥已生成！\033[m")
+                                print(f"证书文件已保存到 {crt_file}")
+                                print(f"私钥文件已保存到 {key_file}")
+                                print(f"证书 SHA-256 指纹为 {certificate_sha256}")
+                                return cert_domain, certificate_sha256
+
+                        domain_name, certificate_pin_sha256 = generate_certificate()
                         while True:
                             ip_mode = input("1. ipv4模式\n2. ipv6模式\n请输入您的选项：")
                             if ip_mode == '1':
@@ -641,7 +643,7 @@ iptables -t nat -D PREROUTING -i {interface_name} -p udp --dport {first_port}:{l
                             else:
                                 print("\033[91m输入错误，请重新输入！\033[m")
                         insecure = "&insecure=1"
-                        hy2_config.write_text(f"listen: :{hy2_port}\n\ntls:\n  cert: /etc/ssl/private/{domain_name}.crt\n  key: /etc/ssl/private/{domain_name}.key\n\nauth:\n  type: password\n  password: {hy2_passwd}\n\nmasquerade:\n  type: proxy\n  proxy:\n    url: {hy2_url}\n    rewriteHost: true\n\nignoreClientBandwidth: {brutal_mode}\n\n{obfs_mode}\n{sniff_mode}\n")
+                        hy2_config.write_text(f"listen: :{hy2_port}\n\ntls:\n  cert: /etc/hy2config/ssl/{domain_name}.crt\n  key: /etc/hy2config/ssl/{domain_name}.key\n\nauth:\n  type: password\n  password: {hy2_passwd}\n\nmasquerade:\n  type: proxy\n  proxy:\n    url: {hy2_url}\n    rewriteHost: true\n\nignoreClientBandwidth: {brutal_mode}\n\n{obfs_mode}\n{sniff_mode}\n")
                         break
                     elif choice_2 == "3":
                         hy2_cert = input("请输入您的证书路径：\n")
@@ -656,18 +658,42 @@ iptables -t nat -D PREROUTING -i {interface_name} -p udp --dport {first_port}:{l
 
                 os.system("clear")
                 hy2_passwd = urllib.parse.quote(hy2_passwd)
-                hy2_v2ray = f"hysteria2://{hy2_passwd}@{hy2_domain}:{hy2_port}?sni={domain_name}{obfs_scheme}{insecure}{jump_ports_hy2}#{hy2_username}"
-                print("您的 v2ray 二维码为：\n")
-                time.sleep(1)
-                # 修复：使用 subprocess 避免命令注入
-                subprocess.run(f'echo {shlex.quote(hy2_v2ray)} | qrencode -s 1 -m 1 -t ANSI256 -o -', shell=True, executable="/bin/bash")
-                print(f"\n\n\033[91m您的hy2链接为: {hy2_v2ray}\n请使用v2ray/nekobox/v2rayNG/nekoray软件导入\033[m\n\n")
-                hy2_url_scheme.write_text(f"您的 v2ray hy2配置链接为：{hy2_v2ray}\n")
+                hy2_link_prefix = f"hysteria2://{hy2_passwd}@{hy2_domain}:{hy2_port}?sni={domain_name}{obfs_scheme}"
+                hy2_link_suffix = f"{jump_ports_hy2}#{hy2_username}"
+
+                if certificate_pin_sha256:
+                    hy2_v2ray = f"{hy2_link_prefix}&pinSHA256={certificate_pin_sha256}{hy2_link_suffix}"
+                    hy2_singbox = f"{hy2_link_prefix}&insecure=1{hy2_link_suffix}"
+                    hy2_subscription = hy2_singbox
+
+                    print("您的 Xray/v2rayN 固定证书二维码为：\n")
+                    time.sleep(1)
+                    subprocess.run(f'echo {shlex.quote(hy2_v2ray)} | qrencode -s 1 -m 1 -t ANSI256 -o -', shell=True, executable="/bin/bash")
+                    print(f"\n\n\033[91m您的 Xray/v2rayN hy2 固定证书链接为: {hy2_v2ray}\033[m\n\n")
+
+                    print("您的 sing-box 兼容二维码为：\n")
+                    subprocess.run(f'echo {shlex.quote(hy2_singbox)} | qrencode -s 1 -m 1 -t ANSI256 -o -', shell=True, executable="/bin/bash")
+                    print(f"\n\n\033[91m您的 sing-box hy2 链接为: {hy2_singbox}\n该链接保留 insecure=1，并用于 Clash/sing-box/Surge 订阅转换\033[m\n\n")
+
+                    hy2_url_scheme.write_text(
+                        f"您的 Xray/v2rayN hy2 固定证书配置链接为：{hy2_v2ray}\n"
+                        f"您的 sing-box hy2 兼容配置链接为：{hy2_singbox}\n"
+                    )
+                else:
+                    hy2_v2ray = f"{hy2_link_prefix}{insecure}{hy2_link_suffix}"
+                    hy2_subscription = hy2_v2ray
+                    print("您的 v2ray 二维码为：\n")
+                    time.sleep(1)
+                    # 修复：使用 subprocess 避免命令注入
+                    subprocess.run(f'echo {shlex.quote(hy2_v2ray)} | qrencode -s 1 -m 1 -t ANSI256 -o -', shell=True, executable="/bin/bash")
+                    print(f"\n\n\033[91m您的hy2链接为: {hy2_v2ray}\n请使用v2ray/nekobox/v2rayNG/nekoray软件导入\033[m\n\n")
+                    hy2_url_scheme.write_text(f"您的 v2ray hy2配置链接为：{hy2_v2ray}\n")
+
                 print("是否需要下载clash/singbox/surge订阅链接生成的模板文件用于导入软件，需要调用到外部链接（您的订阅信息不会被泄露）")
                 choice_3 = input("请输入您的选项（请输入 y/n ）:")
                 if choice_3 == "y":
                     print("正在下载 clash,sing-box,surge 配置文件到/etc/hy2config/clash.yaml")
-                    hy2_v2ray_url = urllib.parse.quote(hy2_v2ray)
+                    hy2_v2ray_url = urllib.parse.quote(hy2_subscription)
                     url_rule = "&ua=&selectedRules=%5B%22Location%3ACN%22%2C%22Private%22%2C%22Non-China%22%2C%22Github%22%2C%22Google%22%2C%22Youtube%22%2C%22AI+Services%22%2C%22Telegram%22%2C%22Ad+Block%22%5D&customRules=%5B%5D&include_auto_select=false"
                     # 修复：使用 subprocess 列表形式避免命令注入
                     subprocess.run(["curl", "-o", "/etc/hy2config/clash.yaml", f"https://sub.baibaicat.site/clash?config={hy2_v2ray_url}{url_rule}"])
